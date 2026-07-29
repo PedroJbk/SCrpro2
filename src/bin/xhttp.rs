@@ -6,8 +6,14 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::{timeout, Duration};
 
-use tokio_rustls::rustls::{self, Certificate, PrivateKey};
-use tokio_rustls::TlsAcceptor;
+// Trocado de rustls para native-tls (OpenSSL no Linux). O rustls rejeita, por
+// design e sem opção de relaxar, qualquer ClientHello sem a extensão
+// signature_algorithms — e é exatamente isso que o cliente DTunnel manda no
+// modo XHTTP, causando "peer is incompatible: SignatureAlgorithmsExtensionRequired"
+// e o app ficando preso em "Conectando". OpenSSL é bem mais tolerante com
+// handshakes fora do padrão estrito da RFC.
+use native_tls::Identity;
+use tokio_native_tls::TlsAcceptor;
 
 /// Tipo de erro unificado para o projeto
 type XhttpError = Box<dyn std::error::Error + Send + Sync>;
@@ -74,7 +80,7 @@ async fn handle_xhttp_client(
     ssh_port: u16,
 ) -> Result<(), XhttpError> {
     let mut peek_buf = [0u8; 3];
-    let peek_result = timeout(Duration::from_secs(5), stream.peek(&mut peek_buf)).await;
+    let peek_result = timeout(Duration::from_secs(10), stream.peek(&mut peek_buf)).await;
     let bytes_peeked = match peek_result {
         Ok(Ok(n)) => n,
         _ => return Ok(()),
@@ -94,6 +100,42 @@ async fn handle_xhttp_client(
     handle_ssh_direct(stream, ssh_port).await
 }
 
+/// Tempo máximo total esperando os headers HTTP completos chegarem.
+/// Em 3G/sinal fraco a requisição pode chegar fragmentada em vários pacotes
+/// TCP; um único `read()` costuma pegar só um pedaço. 15s dá folga para
+/// redes ruins sem deixar a conexão pendurada para sempre.
+const HEADER_READ_TIMEOUT_SECS: u64 = 15;
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+
+/// Lê do stream em loop, acumulando bytes até encontrar o fim dos headers
+/// HTTP ("\r\n\r\n") ou até estourar o timeout/tamanho máximo. Substitui o
+/// antigo "um read só" que quebrava sempre que a requisição chegava
+/// fragmentada em mais de um segmento TCP.
+async fn read_http_headers<S>(stream: &mut S) -> Option<Vec<u8>>
+where
+    S: AsyncReadExt + Unpin,
+{
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    let deadline = Duration::from_secs(HEADER_READ_TIMEOUT_SECS);
+
+    loop {
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            return Some(buf);
+        }
+        if buf.len() >= MAX_HEADER_BYTES {
+            return None;
+        }
+        match timeout(deadline, stream.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+            _ => {
+                // conexão fechada, erro de leitura, ou timeout total estourado
+                return if buf.is_empty() { None } else { Some(buf) };
+            }
+        }
+    }
+}
+
 async fn handle_tls_dual(
     stream: TcpStream,
     status: &str,
@@ -102,18 +144,15 @@ async fn handle_tls_dual(
     let cert_path = "/opt/sdproxy/cert.pem";
     let key_path = "/opt/sdproxy/key.pem";
 
-    let config = build_tls_config(cert_path, key_path)?;
-    let acceptor = TlsAcceptor::from(Arc::new(config));
+    let acceptor = build_tls_acceptor(cert_path, key_path)?;
     let mut tls_stream = acceptor.accept(stream).await.map_err(|e| Box::new(e) as XhttpError)?;
 
-    let mut buf = vec![0u8; 4096];
-    let n = match timeout(Duration::from_secs(3), tls_stream.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => n,
-        _ => return handle_ssh_direct_tls(tls_stream, ssh_port, None).await,
+    let data = match read_http_headers(&mut tls_stream).await {
+        Some(d) => d,
+        None => return handle_ssh_direct_tls(tls_stream, ssh_port, None).await,
     };
 
-    let data = &buf[..n];
-    let http_str = String::from_utf8_lossy(data);
+    let http_str = String::from_utf8_lossy(&data);
 
     if http_str.contains("GET ") {
         if let Some((_, path)) = parse_http_request(&http_str) {
@@ -121,7 +160,7 @@ async fn handle_tls_dual(
         }
     } else if http_str.contains("POST ") {
         if let Some((_, path)) = parse_http_request(&http_str) {
-            return handle_xhttp_post_tls(&mut tls_stream, data, &path, status).await;
+            return handle_xhttp_post_tls(&mut tls_stream, &data, &path, status).await;
         }
     }
 
@@ -131,13 +170,15 @@ async fn handle_tls_dual(
         return handle_ssh_direct_tls(tls_stream, ssh_port, None).await;
     }
 
-    handle_ssh_direct_tls(tls_stream, ssh_port, Some(data.to_vec())).await
+    handle_ssh_direct_tls(tls_stream, ssh_port, Some(data)).await
 }
 
 async fn handle_http_dual_raw(mut stream: TcpStream, status: &str, ssh_port: u16) -> Result<(), XhttpError> {
-    let mut buf = vec![0u8; 8192];
-    let n = stream.read(&mut buf).await.map_err(|e| Box::new(e) as XhttpError)?;
-    let http_str = String::from_utf8_lossy(&buf[..n]);
+    let data = match read_http_headers(&mut stream).await {
+        Some(d) => d,
+        None => return handle_ssh_direct(stream, ssh_port).await,
+    };
+    let http_str = String::from_utf8_lossy(&data);
 
     if http_str.contains("GET ") {
         if let Some((_, path)) = parse_http_request(&http_str) {
@@ -145,7 +186,7 @@ async fn handle_http_dual_raw(mut stream: TcpStream, status: &str, ssh_port: u16
         }
     } else if http_str.contains("POST ") {
         if let Some((_, path)) = parse_http_request(&http_str) {
-            return handle_xhttp_post_raw(&mut stream, &buf[..n], &path, status).await;
+            return handle_xhttp_post_raw(&mut stream, &data, &path, status).await;
         }
     }
 
@@ -169,7 +210,7 @@ async fn handle_ssh_direct(stream: TcpStream, ssh_port: u16) -> Result<(), Xhttp
     Ok(())
 }
 
-async fn handle_ssh_direct_tls(tls_stream: tokio_rustls::server::TlsStream<TcpStream>, ssh_port: u16, initial_data: Option<Vec<u8>>) -> Result<(), XhttpError> {
+async fn handle_ssh_direct_tls(tls_stream: tokio_native_tls::TlsStream<TcpStream>, ssh_port: u16, initial_data: Option<Vec<u8>>) -> Result<(), XhttpError> {
     let mut ssh = TcpStream::connect(format!("127.0.0.1:{}", ssh_port)).await.map_err(|e| Box::new(e) as XhttpError)?;
     if let Some(data) = initial_data {
         ssh.write_all(&data).await.map_err(|e| Box::new(e) as XhttpError)?;
@@ -199,7 +240,7 @@ fn resolve_session_id(path: &str) -> String {
 }
 
 async fn handle_xhttp_get_tls(
-    tls: &mut tokio_rustls::server::TlsStream<TcpStream>,
+    tls: &mut tokio_native_tls::TlsStream<TcpStream>,
     path: &str,
     status: &str,
     ssh_port: u16
@@ -333,7 +374,7 @@ async fn handle_xhttp_get_raw(stream: &mut TcpStream, path: &str, status: &str, 
     Ok(())
 }
 
-async fn handle_xhttp_post_tls(tls: &mut tokio_rustls::server::TlsStream<TcpStream>, req: &[u8], path: &str, _: &str) -> Result<(), XhttpError> {
+async fn handle_xhttp_post_tls(tls: &mut tokio_native_tls::TlsStream<TcpStream>, req: &[u8], path: &str, _: &str) -> Result<(), XhttpError> {
     let sid = extract_path_info(path).0;
 
     let cl = extract_content_length_from_bytes(req).unwrap_or(0);
@@ -423,15 +464,17 @@ fn extract_content_length_from_bytes(data: &[u8]) -> Option<usize> {
     None
 }
 
-fn build_tls_config(cp: &str, kp: &str) -> Result<rustls::ServerConfig, XhttpError> {
-    let certs: Vec<Certificate> = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(cp).map_err(|e| Box::new(e) as XhttpError)?)).map_err(|e| Box::new(e) as XhttpError)?.into_iter().map(Certificate).collect();
-    let keys: Vec<PrivateKey> = rustls_pemfile::pkcs8_private_keys(&mut std::io::BufReader::new(std::fs::File::open(kp).map_err(|e| Box::new(e) as XhttpError)?)).map_err(|e| Box::new(e) as XhttpError)?.into_iter().map(PrivateKey).collect();
-    if certs.is_empty() || keys.is_empty() { return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Certs empty")) as XhttpError); }
-    let mut c = rustls::ServerConfig::builder().with_safe_defaults().with_no_client_auth().with_single_cert(certs, keys.into_iter().next().unwrap()).map_err(|e| Box::new(e) as XhttpError)?;
+/// Monta o acceptor TLS a partir do cert/key em PEM usando native-tls
+/// (OpenSSL no Linux). Muito mais tolerante que rustls com handshakes que
+/// não seguem a RFC à risca — é o caso do cliente xHTTP do DTunnel.
+fn build_tls_acceptor(cp: &str, kp: &str) -> Result<TlsAcceptor, XhttpError> {
+    let cert_pem = std::fs::read(cp).map_err(|e| Box::new(e) as XhttpError)?;
+    let key_pem = std::fs::read(kp).map_err(|e| Box::new(e) as XhttpError)?;
 
-    c.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let identity = Identity::from_pkcs8(&cert_pem, &key_pem).map_err(|e| Box::new(e) as XhttpError)?;
+    let native_acceptor = native_tls::TlsAcceptor::new(identity).map_err(|e| Box::new(e) as XhttpError)?;
 
-    Ok(c)
+    Ok(TlsAcceptor::from(native_acceptor))
 }
 
 fn get_port() -> u16 { std::env::args().enumerate().find(|(_, a)| a == "--port" || a == "-p").and_then(|(i, _)| std::env::args().nth(i+1)).and_then(|a| a.parse().ok()).unwrap_or(443) }
