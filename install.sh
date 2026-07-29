@@ -1,7 +1,7 @@
 #!/bin/bash
-# SDProxy Installer - Version v3.1.0
+# SCrpro2 Installer - Version v1
 
-REPO_URL="https://github.com/PedroJbk/BDRProxy.git"
+REPO_URL="https://github.com/PedroJbk/SCrpro2.git"
 REPO_BRANCH="main"
 CMD_NAME="sdproxy"
 TOTAL_STEPS=7
@@ -47,7 +47,7 @@ echo -e "${BLUE}${BOLD} ╚════██║██║  ██║██╔═
 echo -e "${BLUE}${BOLD} ███████║██████╔╝██║     ██║  ██║╚██████╔╝██╔╝ ██╗   ██║   ${NC}"
 echo -e "${BLUE}${BOLD} ╚══════╝╚═════╝ ╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ${NC}"
 echo -e "${BLUE}${BOLD}--------------------------------------------------------------${NC}"
-log_info "Iniciando instalação do SDProxy v3.1.0 (🇧🇷)..."
+log_info "Iniciando instalação do SCrpro2 v1 (🇧🇷)..."
 
 # --- Etapa 1 ---
 show_progress "Atualizando dependências..."
